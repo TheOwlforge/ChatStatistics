@@ -1,3 +1,4 @@
+library(data.table) #fread
 library(rjson) # to read json format
 library(dplyr) # used to convert to df
 library(chron) # date formatting
@@ -7,6 +8,12 @@ library(scales) # plotting
 library(ggstream) # plotting
 library(RColorBrewer) # color palettes
 library(forcats)
+library(tidytext) # text analysis
+library(stopwords)
+library(stringr)
+library(wordcloud)
+library(ggwordcloud)
+library(ggpubr) # multiple subplots
 
 # replace with your own names
 filename <- "result.json"
@@ -52,6 +59,132 @@ plot_bar_number <- function(df, unit_string, bar_width){
     scale_fill_manual(values=c(color_p1, color_p2))
   
   ggsave(paste0("out_", person2, "/", "number_", unit_string, img_format), width = img_width, height = img_height)
+}
+
+# copied from https://gist.github.com/PolMine/70eeb095328070c18bd00ee087272adf
+get_sentiws <- function(){
+  
+  sentiws_tmp_dir <- file.path(tempdir(), "sentiws")
+  if (!file.exists(sentiws_tmp_dir)) dir.create(sentiws_tmp_dir)
+  sentiws_zipfile <- file.path(sentiws_tmp_dir, "SentiWS_v2.0c.zip")
+  sentiws_url <- "http://pcai056.informatik.uni-leipzig.de/downloads/etc/SentiWS/SentiWS_v2.0.zip"
+  download.file(url = sentiws_url, destfile = sentiws_zipfile)
+  unzip(zipfile = sentiws_zipfile, exdir = sentiws_tmp_dir)
+  
+  .unfold <- function(.SD){
+    pos <- gsub("^([A-Z]+)\\s+.*$", "\\1", .SD[["data"]][1])
+    weight <- as.numeric(gsub("^[A-Z]+\\s+(-?\\d\\.\\d+).*$", "\\1", .SD[["data"]][1]))
+    words <- gsub("^[A-Z]+\\s+-?\\d\\.\\d+\\s*(.*?)\\s*$", "\\1", .SD[["data"]][1])
+    words <- if (!grepl("^\\s*$", words)) strsplit(x = words, split = ",")[[1]] else NULL
+    list(
+      word = c(.SD[["word"]][1], words),
+      base = c(TRUE, rep(FALSE, times = length(words))),
+      lemma = .SD[["word"]][1],
+      pos = pos,
+      weight = weight
+    )
+  }
+  
+  
+  dts <- lapply(
+    c(positive = "SentiWS_v2.0_Positive.txt", negative = "SentiWS_v2.0_Negative.txt"),
+    function(filename){
+      dt <- fread(file.path(sentiws_tmp_dir, filename), sep = "|", encoding="UTF-8")
+      colnames(dt) <- c("word", "data")
+      dt[, "id" :=  1L:nrow(dt)]
+      dt[, .unfold(.SD), by = c("id")]
+    }
+  )
+  rbindlist(dts)
+}
+
+get_weighted_words <- function(all_words, all_words_low, all_sentiments, all_sentiments_low) {
+  weighted_words <- all_words %>%
+    inner_join(all_sentiments) %>%
+    group_by(lemma) %>%
+    summarise(Freq = sum(weight)) %>%
+    arrange(desc(Freq))
+  weighted_words_low <- all_words_low %>%
+    inner_join(all_sentiments_low) %>%
+    group_by(lemma) %>%
+    summarise(Freq = sum(weight)) %>%
+    arrange(desc(Freq))
+  
+  neg_words <- rbind(tail(weighted_words, 20), tail(weighted_words_low, 20)) %>%
+    group_by(lemma) %>%
+    summarise(Freq = sum(Freq) / 2) %>%
+    arrange(Freq)
+  pos_words <- rbind(head(weighted_words, 20), head(weighted_words_low, 20)) %>%
+    group_by(lemma) %>%
+    summarise(Freq = sum(Freq) / 2) %>%
+    arrange(desc(Freq))
+  
+  return(list(neg_words, pos_words))
+}
+
+get_word_count <- function(all_words, all_words_low, all_sentiments, all_sentiments_low) {
+  count_words <- all_words %>%
+    inner_join(all_sentiments) %>%
+    group_by(lemma) %>%
+    summarise(count = n()) %>%
+    arrange(desc(count))
+  count_words_low <- all_words_low %>%
+    inner_join(all_sentiments_low) %>%
+    group_by(lemma) %>%
+    summarise(count = n()) %>%
+    arrange(desc(count))
+  
+  words <- rbind(head(count_words, 20), head(count_words_low, 20)) %>%
+    group_by(lemma) %>%
+    summarise(count = sum(count) / 2) %>%
+    arrange(desc(count))
+  
+  return(words)
+}
+
+get_noun_count <- function(all_words, all_words_low, all_sentiments, all_sentiments_low) {
+  count_words_NN <- all_words %>%
+    inner_join(all_sentiments[all_sentiments$pos == "NN",]) %>%
+    group_by(lemma) %>%
+    summarise(count = n()) %>%
+    arrange(desc(count)) %>%
+    mutate(lemma = str_to_title(lemma))
+  count_words_NN_low <- all_words_low %>%
+    inner_join(all_sentiments_low[all_sentiments_low$pos == "NN",]) %>%
+    group_by(lemma) %>%
+    summarise(count = n()) %>%
+    arrange(desc(count)) %>%
+    mutate(lemma = str_to_title(lemma))
+  
+  nouns <- rbind(head(count_words_NN, 20), head(count_words_NN_low, 20)) %>%
+    group_by(lemma) %>%
+    summarise(count = sum(count) / 2) %>%
+    arrange(desc(count))
+  
+  return(nouns)
+}
+
+get_weighted_time <- function(all_words_time, all_words_time_low, all_sentiments, all_sentiments_low, date_scale = "week") {
+  all_words_time$date <- lubridate::floor_date(all_words_time$date, unit = date_scale)
+  all_words_time_low$date <- lubridate::floor_date(all_words_time_low$date, unit = date_scale)
+  
+  weighted_words_time <- all_words_time %>%
+    inner_join(all_sentiments) %>%
+    group_by(date) %>%
+    summarise(weight = sum(weight)) %>%
+    arrange(date)
+  weighted_words_time_low <- all_words_time_low %>%
+    inner_join(all_sentiments_low) %>%
+    group_by(date) %>%
+    summarise(weight = sum(weight)) %>%
+    arrange(date)
+  
+  time <- rbind(weighted_words_time, weighted_words_time_low) %>%
+    group_by(date) %>%
+    summarise(weight = sum(weight) / 2) %>%
+    arrange(date)
+  
+  return (time)
 }
 
 ###################################################################
@@ -310,7 +443,7 @@ ggsave(paste0("out_", person2, "/", "type_stream", img_format), width = img_widt
 
 # plot text length
 msg_A <- df[df$from == person1,]
-length_A <- aggregate(msg_A$text_length, by=list(as.Date(msg_A$date)), sum)
+length_A <- aggregate(msg_A$text_length, by=list(lubridate::floor_date(msg_A$date, unit = "day")), sum)
 length_A$date <- length_A$Group.1
 length_A$count <- length_A$x
 length_A$from <- person1
@@ -318,7 +451,7 @@ length_A$Group.1 <- NULL
 length_A$x <- NULL
 
 msg_B <- df[df$from == person2,]
-length_B <- aggregate(msg_B$text_length, by=list(as.Date(msg_B$date)), sum)
+length_B <- aggregate(msg_B$text_length, by=list(lubridate::floor_date(msg_B$date, unit = "day")), sum)
 length_B$date <- length_B$Group.1
 length_B$count <- length_B$x
 length_B$from <- person2
@@ -354,30 +487,32 @@ rownames(length_table) <- 1:length(length_table$date)
 length_table_inv <- length_table
 length_table_inv[length_table$from == person2,]$count <- - length_table[length_table$from == person2,]$count
 length_table_weekly_A <- length_table[length_table$from == person1,]
-length_table_weekly_A$date <- lubridate::floor_date(length_table_weekly_A$date, unit = "weekly")
+length_table_weekly_A$date <- lubridate::floor_date(length_table_weekly_A$date, unit = "week")
 length_table_weekly_A <- aggregate(length_table_weekly_A$count, by=list(as.Date(length_table_weekly_A$date)), sum)
 length_table_weekly_B <- length_table[length_table$from == person2,]
-length_table_weekly_B$date <- lubridate::floor_date(length_table_weekly_B$date, unit = "weekly")
+length_table_weekly_B$date <- lubridate::floor_date(length_table_weekly_B$date, unit = "week")
 length_table_weekly_B <- aggregate(length_table_weekly_B$count, by=list(as.Date(length_table_weekly_B$date)), sum)
 
 length_table_weekly_A[,3] <- person1
 length_table_weekly_B[,3] <- person2
 length_table_weekly <- rbind(length_table_weekly_A, length_table_weekly_B)
 colnames(length_table_weekly) <- c("date", "count", "from")
+colnames(length_table_weekly_A) <- c("date", "count", "from")
+colnames(length_table_weekly_B) <- c("date", "count", "from")
 
-for (i in 1:length(length_table_weekly_B$Group.1)){
-  if(length(length_table_weekly_A[length_table_weekly_A$Group.1 == length_table_weekly_B$Group.1[i],]$Group.1) == 0){
-    new_row = data.frame(length_table_weekly_B$Group.1[i], as.integer(0))
-    names(new_row)=c("Group.1","x")
+for (i in 1:length(length_table_weekly_B$date)){
+  if(length(length_table_weekly_A[length_table_weekly_A$date == length_table_weekly_B$date[i],]$date) == 0){
+    new_row = data.frame(length_table_weekly_B$date[i], as.integer(0), person1)
+    names(new_row)=c("date","count", "from")
     length_table_weekly_A <- rbind(length_table_weekly_A, new_row)
     print(i)
   }
 }
-for (j in 1:length(length_table_weekly_A$Group.1)){
-  if(length(length_table_weekly_B[length_table_weekly_B$Group.1 == length_table_weekly_A$Group.1[j],]$Group.1) == 0){
-    new_row = data.frame(length_table_weekly_A$Group.1[j], as.integer(0))
-    names(new_row)=c("Group.1","x")
-    length_table_weekly_B <- rbind(length_table_weekly_B)
+for (j in 1:length(length_table_weekly_A$date)){
+  if(length(length_table_weekly_B[length_table_weekly_B$date == length_table_weekly_A$date[j],]$date) == 0){
+    new_row = data.frame(length_table_weekly_A$date[j], as.integer(0), person2)
+    names(new_row)=c("date","count", "from")
+    length_table_weekly_B <- rbind(length_table_weekly_B, new_row)
     print(j)
   }
 }
@@ -412,3 +547,228 @@ ggplot(length_table, aes(x = date, y = count, fill=from)) +
   scale_y_continuous(expand = expansion(mult = c(0.1, .1))) +
   scale_fill_manual(values=c(color_p1, color_p2))
 ggsave(paste0("out_", person2, "/", "length_stream", img_format), width = img_width, height = img_height)
+
+#########################################################################
+######################  TEXT ANALYSIS  ##################################
+#########################################################################
+
+unfiltered <- data_frame(text = df_raw$text) %>% 
+  unnest_tokens(word, text) %>%    # split words
+  count(word, sort = TRUE)    # count occurrences
+head(unfiltered, 20)
+
+stop_german <- data.frame(word = stopwords::stopwords("de"), stringsAsFactors = FALSE)
+wo_stopwords <- data_frame(text = df_raw$text) %>% 
+  unnest_tokens(word, text) %>%    # split words
+  anti_join(stop_words) %>%    # take out english stopwords
+  anti_join(stop_german) %>%    # take out german stopwords
+  count(word, sort = TRUE)    # count occurrences
+head(wo_stopwords, 20)
+
+all_sentiments <- get_sentiws()
+all_sentiments_low <- all_sentiments %>%
+  mutate(word = tolower(word))
+all_words <- data_frame(text = df_raw$text) %>% 
+  unnest_tokens(word, text, to_lower=FALSE)
+all_words_1 <- data_frame(text = df_raw$text[df$from == person1]) %>% 
+  unnest_tokens(word, text, to_lower=FALSE)
+all_words_2 <- data_frame(text = df_raw$text[df$from == person2]) %>% 
+  unnest_tokens(word, text, to_lower=FALSE)
+all_words_low <- all_words %>% 
+  mutate(word = tolower(word))
+all_words_low_1 <- all_words_1 %>% 
+  mutate(word = tolower(word))
+all_words_low_2 <- all_words_2 %>% 
+  mutate(word = tolower(word))
+
+#weighted words
+weighted_list_all <- get_weighted_words(all_words, all_words_low, all_sentiments, all_sentiments_low)
+weighted_list_1 <- get_weighted_words(all_words_1, all_words_low_1, all_sentiments, all_sentiments_low)
+weighted_list_2 <- get_weighted_words(all_words_2, all_words_low_2, all_sentiments, all_sentiments_low)
+
+weighted_list_all_neg <- data.frame(weighted_list_all[1])
+max_neg <- max(weighted_list_all_neg$Freq)
+weighted_list_all_neg$Freq <- weighted_list_all_neg$Freq / max(weighted_list_all_neg$Freq)
+weighted_list_all_pos <- data.frame(weighted_list_all[2])
+max_pos <- max(weighted_list_all_pos$Freq)
+weighted_list_all_pos$Freq <- weighted_list_all_pos$Freq / max(weighted_list_all_pos$Freq)
+
+weighted_list_1_neg <- data.frame(weighted_list_1[1])
+weighted_list_1_neg$Freq <- weighted_list_1_neg$Freq / max_neg
+weighted_list_1_pos <- data.frame(weighted_list_1[2])
+weighted_list_1_pos$Freq <- weighted_list_1_pos$Freq / max_pos
+weighted_list_2_neg <- data.frame(weighted_list_2[1])
+weighted_list_2_neg$Freq <- weighted_list_2_neg$Freq / max_neg
+weighted_list_2_pos <- data.frame(weighted_list_2[2])
+weighted_list_2_pos$Freq <- weighted_list_2_pos$Freq / max_pos
+
+scale_size_neg <- 20
+scale_size_pos <- 35
+gg_neg <- ggplot(weighted_list_all_neg, aes(label = lemma, size = Freq, color = Freq)) +
+  geom_text_wordcloud() + 
+  scale_size_area(max_size = scale_size_neg) +
+  theme_classic(base_size = 20) +
+  theme(axis.line=element_blank())+
+  scale_color_gradient(low = "darkred", high = "tomato")
+gg_pos <- ggplot(weighted_list_all_pos, aes(label = lemma, size = Freq, color = Freq)) +
+  geom_text_wordcloud() + 
+  scale_size_area(max_size = scale_size_pos) +
+  theme_classic(base_size = 20) +
+  theme(axis.line=element_blank())+
+  scale_color_gradient(low = "darkgreen", high = "green")
+gg_neg_1 <- ggplot(weighted_list_1_neg, aes(label = lemma, size = Freq, color = Freq)) +
+  geom_text_wordcloud() + 
+  scale_size_area(max_size = scale_size_neg) +
+  theme_classic(base_size = 20) +
+  theme(axis.line=element_blank())+
+  scale_color_gradient(low = "darkred", high = "tomato")
+gg_pos_1 <- ggplot(weighted_list_1_pos, aes(label = lemma, size = Freq, color = Freq)) +
+  geom_text_wordcloud() + 
+  scale_size_area(max_size = scale_size_pos) +
+  theme_classic(base_size = 20) +
+  theme(axis.line=element_blank())+
+  scale_color_gradient(low = "darkgreen", high = "green")
+gg_neg_2 <- ggplot(weighted_list_2_neg, aes(label = lemma, size = Freq, color = Freq)) +
+  geom_text_wordcloud() + 
+  scale_size_area(max_size = scale_size_neg) +
+  theme_classic(base_size = 20) +
+  theme(axis.line=element_blank())+
+  scale_color_gradient(low = "darkred", high = "tomato")
+gg_pos_2 <- ggplot(weighted_list_2_pos, aes(label = lemma, size = Freq, color = Freq)) +
+  geom_text_wordcloud() + 
+  scale_size_area(max_size = scale_size_pos) +
+  theme_classic(base_size = 20) +
+  theme(axis.line=element_blank())+
+  scale_color_gradient(low = "darkgreen", high = "green")
+tgrob <- text_grob(title_name,size = 20)
+plot_0 <- as_ggplot(tgrob) + theme_classic(base_size = 20) + theme(axis.line=element_blank())
+figure_weight <- ggarrange(plot_0, ggarrange(gg_neg, gg_pos, gg_neg_1, gg_pos_1, gg_neg_2, gg_pos_2, labels = c("Overall", "", person1, "", person2, ""), ncol = 2, nrow = 3), nrow = 2, labels = "", heights = c(1,13))
+figure_weight
+ggsave(paste0("out_", person2, "/", "wordcloud_posneg", img_format), width = img_width, height = img_height)
+
+#word count
+count_list_all <- get_word_count(all_words, all_words_low, all_sentiments, all_sentiments_low)
+count_list_1 <- get_word_count(all_words_1, all_words_low_1, all_sentiments, all_sentiments_low)
+count_list_2 <- get_word_count(all_words_2, all_words_low_2, all_sentiments, all_sentiments_low)
+
+max_count <- max(count_list_all$count)
+count_list_all$count <- count_list_all$count / max_count
+count_list_1$count <- count_list_1$count / max_count
+count_list_2$count <- count_list_2$count / max_count
+
+scale_size_small <- 30
+scale_size_large <- 40
+gg_count_all <- ggplot(count_list_all, aes(label = lemma, size = count, color = count)) +
+  geom_text_wordcloud() + 
+  scale_size_area(max_size = scale_size_large) +
+  theme_classic(base_size = 20) +
+  theme(axis.line=element_blank())+
+  scale_color_gradient(low = "darkblue", high = "lightblue")
+gg_count_1 <- ggplot(count_list_1, aes(label = lemma, size = count, color = count)) +
+  geom_text_wordcloud() + 
+  scale_size_area(max_size = scale_size_small) +
+  theme_classic(base_size = 20) +
+  theme(axis.line=element_blank())+
+  scale_color_gradient(low = "orange", high = "brown")
+gg_count_2 <- ggplot(count_list_2, aes(label = lemma, size = count, color = count)) +
+  geom_text_wordcloud() + 
+  scale_size_area(max_size = scale_size_small) +
+  theme_classic(base_size = 20) +
+  theme(axis.line=element_blank())+
+  scale_color_gradient(low = "darkgreen", high = "green")
+tgrob <- text_grob(title_name,size = 20)
+plot_0 <- as_ggplot(tgrob) + theme_classic(base_size = 20) + theme(axis.line=element_blank())
+figure_count <- ggarrange(plot_0, gg_count_all, ggarrange(gg_count_1, gg_count_2, labels = c(person1, person2), ncol = 2, nrow = 1), nrow = 3, labels = c("", "Overall"), heights = c(1,5,5))
+figure_count
+ggsave(paste0("out_", person2, "/", "wordcloud_count", img_format), width = img_width, height = img_height)
+
+#noun count
+noun_list_all <- get_noun_count(all_words, all_words_low, all_sentiments, all_sentiments_low)
+noun_list_1 <- get_noun_count(all_words_1, all_words_low_1, all_sentiments, all_sentiments_low)
+noun_list_2 <- get_noun_count(all_words_2, all_words_low_2, all_sentiments, all_sentiments_low)
+
+max_noun <- max(noun_list_all$count)
+noun_list_all$count <- noun_list_all$count / max_noun
+noun_list_1$count <- noun_list_1$count / max_noun
+noun_list_2$count <- noun_list_2$count / max_noun
+
+scale_size_small <- 20
+scale_size_large <- 30
+gg_noun_all <- ggplot(noun_list_all, aes(label = lemma, size = count, color = count)) +
+  geom_text_wordcloud() + 
+  scale_size_area(max_size = scale_size_large) +
+  theme_classic(base_size = 20) +
+  theme(axis.line=element_blank())+
+  scale_color_gradient(low = "darkblue", high = "lightblue")
+gg_noun_1 <- ggplot(noun_list_1, aes(label = lemma, size = count, color = count)) +
+  geom_text_wordcloud() + 
+  scale_size_area(max_size = scale_size_small) +
+  theme_classic(base_size = 20) +
+  theme(axis.line=element_blank())+
+  scale_color_gradient(low = "orange", high = "brown")
+gg_noun_2 <- ggplot(noun_list_2, aes(label = lemma, size = count, color = count)) +
+  geom_text_wordcloud() + 
+  scale_size_area(max_size = scale_size_small) +
+  theme_classic(base_size = 20) +
+  theme(axis.line=element_blank())+
+  scale_color_gradient(low = "darkgreen", high = "green")
+tgrob <- text_grob(title_name,size = 20)
+plot_0 <- as_ggplot(tgrob) + theme_classic(base_size = 20) + theme(axis.line=element_blank())
+figure_noun <- ggarrange(plot_0, gg_noun_all, ggarrange(gg_noun_1, gg_noun_2, labels = c(person1, person2), ncol = 2, nrow = 1), nrow = 3, labels = c("", "Overall"), heights = c(1,5,5))
+figure_noun
+ggsave(paste0("out_", person2, "/", "wordcloud_noun", img_format), width = img_width, height = img_height)
+
+#weighted words over time
+all_words_time <- data_frame(text = df_raw$text, date = lubridate::floor_date(df$date, unit = "day")) %>% 
+  unnest_tokens(word, text, to_lower=FALSE)
+all_words_time_1 <- data_frame(text = df_raw$text[df$from == person1], date = lubridate::floor_date(df$date[df$from == person1], unit = "day")) %>% 
+  unnest_tokens(word, text, to_lower=FALSE)
+all_words_time_2 <- data_frame(text = df_raw$text[df$from == person2], date = lubridate::floor_date(df$date[df$from == person2], unit = "day")) %>% 
+  unnest_tokens(word, text, to_lower=FALSE)
+all_words_time_low <- all_words_time %>% 
+  mutate(word = tolower(word))
+all_words_time_low_1 <- all_words_time_1 %>% 
+  mutate(word = tolower(word))
+all_words_time_low_2 <- all_words_time_2 %>% 
+  mutate(word = tolower(word))
+
+weighted_words_time <- get_weighted_time(all_words_time, all_words_time_low, all_sentiments, all_sentiments_low)
+weighted_words_time_1 <- get_weighted_time(all_words_time_1, all_words_time_low_1, all_sentiments, all_sentiments_low)
+weighted_words_time_2 <- get_weighted_time(all_words_time_2, all_words_time_low_2, all_sentiments, all_sentiments_low)
+
+weighted_words_time$weight <- weighted_words_time$weight / max(weighted_words_time$weight, -weighted_words_time$weight)
+
+weighted_words_time_1 <- weighted_words_time_1 %>% 
+  mutate(date = date - ddays(1)) %>% 
+  inner_join(length_table_weekly_A) %>% 
+  mutate(weight = weight * count) %>% 
+  mutate(weight = weight / max(weight, -weight))
+weighted_words_time_2 <- weighted_words_time_2 %>% 
+  mutate(date = date - ddays(1)) %>% 
+  inner_join(length_table_weekly_B) %>% 
+  mutate(weight = weight * count) %>% 
+  mutate(weight = weight / max(weight, -weight))
+
+gg_weight_all <- ggplot(weighted_words_time, aes(x=as.Date(date), y=weight)) +
+  geom_bar(stat="identity", fill = "blue") +
+  labs(x = x_axis_name, y = "Sentiment", title="Overall") +
+  theme_classic(base_size = 15) +
+  theme(panel.grid.major.y = element_line(size=1.0), axis.line = element_line(size = 1.0), axis.ticks = element_line(size=1.0)) +
+  scale_y_continuous(limits = c(-1,1), expand = expansion(mult = c(.1, .1)),  breaks = c(-1,0,1))
+gg_weight_1 <- ggplot(weighted_words_time_1, aes(x=as.Date(date), y=weight)) +
+  geom_bar(stat="identity", fill = color_p1) +
+  labs(x = x_axis_name, y = "Sentiment", title = person1) +
+  theme_classic(base_size = 15) +
+  theme(panel.grid.major.y = element_line(size=1.0), axis.line = element_line(size = 1.0), axis.ticks = element_line(size=1.0)) +
+  scale_y_continuous(limits = c(min(weighted_words_time_1$weight, weighted_words_time_2$weight), max(weighted_words_time_1$weight, weighted_words_time_2$weight)), expand = expansion(mult = c(.1, .1)),  breaks = c(-1,0,1))
+gg_weight_2 <- ggplot(weighted_words_time_2, aes(x=as.Date(date), y=weight)) +
+  geom_bar(stat="identity", fill = color_p2) +
+  labs(x = x_axis_name, y = "Sentiment", title = person2) +
+  theme_classic(base_size = 15) +
+  theme(panel.grid.major.y = element_line(size=1.0), axis.line = element_line(size = 1.0), axis.ticks = element_line(size=1.0)) +
+  scale_y_continuous(limits = c(min(weighted_words_time_1$weight, weighted_words_time_2$weight), max(weighted_words_time_1$weight, weighted_words_time_2$weight)), expand = expansion(mult = c(.1, .1)),  breaks = c(-1,0,1))
+tgrob <- text_grob(title_name,size = 20)
+plot_0 <- as_ggplot(tgrob) + theme_classic(base_size = 20) + theme(axis.line=element_blank())
+figure_weight_time <- ggarrange(plot_0, gg_weight_all, ggarrange(gg_weight_1, gg_weight_2, ncol = 2, nrow = 1), nrow = 3, heights = c(1,5,5))
+figure_weight_time
+ggsave(paste0("out_", person2, "/", "sentiment", img_format), width = img_width, height = img_height)
